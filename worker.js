@@ -44,26 +44,23 @@ const configs = {
             path: '/api',
         },
     ],
+    reverseServer: 'workers.bestip.one',
     debug: false,
 };
 
 export default {
     async fetch(request, env) {
-        return handleRequest(request, env);
-    }
-}
-
-async function handleRequest(request, env) {
-    try {
-        if (request.headers.get("Upgrade") !== "websocket") {
+        try {
+            if (request.headers.get("Upgrade") !== "websocket") {
+                return new Response("404 Not Found", { status: 404 });
+            }
+            return await handleWebSocket(request, env);
+        } catch (err) {
+            if (configs.debug) {
+                console.log(err.stack);
+            }
             return new Response("404 Not Found", { status: 404 });
         }
-        return await handleWebSocket(request, env);
-    } catch (err) {
-        if (configs.debug) {
-            console.log(err.stack);
-        }
-        return new Response("404 Not Found", { status: 404 });
     }
 }
 
@@ -91,15 +88,27 @@ async function handleWebSocket(request, env) {
 
 function selectInbound(url) {
     const uri = new URL(url);
-    const key = configs.inbounds.find(e => e.path === uri.pathname);
-    if (key === undefined) {
+    const config = configs.inbounds.find(e => e.path === uri.pathname);
+    if (config === undefined) {
         throw new Error("Invalid path");
     }
-    const inbound = inbounds.get(key);
-    if (inbound === undefined) {
-        throw new Error("Invalid path");
+    switch (config.type) {
+        case 'trojan': {
+            if (!config.password) {
+                throw new Error("Invalid config");
+            }
+            return new Trojan(config);
+        }
+        case 'vless': {
+            if (!config.uuid) {
+                throw new Error("Invalid config");
+            }
+            return new VLESS(config);
+        }
+        default: {
+            throw new Error("Invalid config");
+        }
     }
-    return inbound;
 }
 
 function streamifyWebSocket(ws) {
@@ -120,16 +129,22 @@ async function createDestinationEndpoint(req, ws, transport) {
         throw new Error("The stream was already closed!");
     }
 
-    const { network, dstAddr, dstPort, data, dataBack } = transport.unmarshalHeader(value);
+    const { network, dstAddrType, dstAddr, dstPort, data, dataBack } = transport.unmarshalHeader(value);
     if (network !== 'tcp') {
         // supports TCP only for now, depends on Cloudflare Workers runtime API.
         throw new Error("Unsupported network: " + network);
     }
 
-    const conn = connect({ hostname: dstAddr, port: dstPort });
+    const isCfIp = configs.reverseServer ? await isIPInCFIPRanges(dstAddrType, dstAddr) : false;
+    const hostname = isCfIp ? configs.reverseServer : dstAddr;
+    const conn = connect({ hostname: hostname, port: dstPort });
 
     if (configs.debug) {
-        console.log(`[TCP] connected ${req.headers.get('x-real-ip')} --> ${dstAddr}:${dstPort}`);
+        if (!isCfIp) {
+            console.log(`[TCP] connected ${req.headers.get('x-real-ip')} --> ${hostname}:${dstPort}`);
+        } else {
+            console.log(`[TCP] connected ${req.headers.get('x-real-ip')} --> ${hostname}:${dstPort} --> ${dstAddr}:${dstPort}`);
+        }
     }
 
     if (dataBack) {
@@ -147,8 +162,8 @@ async function createDestinationEndpoint(req, ws, transport) {
 }
 
 class Trojan {
-    constructor(password) {
-        this.password = password;
+    constructor(config) {
+        this.config = config;
         this.textDecoder = new TextDecoder();
     }
 
@@ -159,7 +174,7 @@ class Trojan {
         }
 
         const passwordHex = this.textDecoder.decode(slice(buf, 0, 56));
-        if (passwordHex !== this.password) {
+        if (passwordHex !== this.config.password) {
             throw new Error("Invalid password");
         }
 
@@ -182,11 +197,13 @@ class Trojan {
         let addrOffset = 60;
         let portOffset = 0;
         let address = '';
+        let aType = '';
         const addrType = bufU8Arr[59];
         switch (addrType) {
             case 1: { // ipv4
                 portOffset = addrOffset + 4;
                 address = bufU8Arr.slice(addrOffset, portOffset).join('.');
+                aType = 'ip4';
                 break;
             }
             case 3: { // domain name
@@ -194,6 +211,7 @@ class Trojan {
                 addrOffset++;
                 portOffset = addrOffset + domainLen;
                 address = this.textDecoder.decode(slice(buf, addrOffset, portOffset));
+                aType = 'domain';
                 break;
             }
             case 4: { // ipv6
@@ -203,6 +221,7 @@ class Trojan {
                     .map(offset => ipView.getUint16(offset).toString(16))
                     .join(':');
                 address = '[' + ipv6 + ']';
+                aType = 'ip6';
                 break;
             }
             default:
@@ -222,6 +241,7 @@ class Trojan {
 
         return {
             network: network,
+            dstAddrType: aType,
             dstAddr: address,
             dstPort: port,
             data: data,
@@ -231,8 +251,8 @@ class Trojan {
 }
 
 class VLESS {
-    constructor(uuid) {
-        this.uuid = uuid;
+    constructor(config) {
+        this.config = config;
         this.textDecoder = new TextDecoder();
     }
 
@@ -249,7 +269,7 @@ class VLESS {
             .join('')
             .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
 
-        if (uuidStr !== this.uuid) {
+        if (uuidStr !== this.config.uuid) {
             throw new Error("Invalid password");
         }
 
@@ -278,6 +298,7 @@ class VLESS {
         }
 
         let address = '';
+        let aType = '';
         let headerLen = 0;
         const addrType = bufU8Arr[addrOffset];
         addrOffset++;
@@ -285,6 +306,7 @@ class VLESS {
             case 1: { // ipv4
                 headerLen = addrOffset + 4;
                 address = bufU8Arr.slice(addrOffset, headerLen).join('.');
+                aType = 'ip4';
                 break;
             }
             case 2: { // domain name
@@ -292,6 +314,7 @@ class VLESS {
                 addrOffset++;
                 headerLen = addrOffset + domainLen;
                 address = this.textDecoder.decode(slice(buf, addrOffset, headerLen));
+                aType = 'domain';
                 break;
             }
             case 3: { // ipv6
@@ -301,6 +324,7 @@ class VLESS {
                     .map(offset => ipView.getUint16(offset).toString(16))
                     .join(':');
                 address = '[' + ipv6 + ']';
+                aType = 'ip6';
                 break;
             }
             default:
@@ -314,6 +338,7 @@ class VLESS {
 
         return {
             network: network,
+            dstAddrType: aType,
             dstAddr: address,
             dstPort: port,
             data: data,
@@ -377,30 +402,104 @@ class WebSocketSink {
     }
 }
 
-function slice(buf, begin, end) {
+const slice = (buf, begin, end) => {
     if (buf.byteLength < end || begin >= end) {
         throw new Error("Invalid buf length");
     }
     return buf.slice(begin, end);
-}
+};
 
-const inbounds = new Map();
+const cfCidrs4 = [
+    '173.245.48.0/20',
+    '103.21.244.0/22',
+    '103.22.200.0/22',
+    '103.31.4.0/22',
+    '141.101.64.0/18',
+    '108.162.192.0/18',
+    '190.93.240.0/20',
+    '188.114.96.0/20',
+    '197.234.240.0/22',
+    '198.41.128.0/17',
+    '162.158.0.0/15',
+    '104.16.0.0/13',
+    '104.24.0.0/14',
+    '172.64.0.0/13',
+    '131.0.72.0/22'
+];
 
-(function init() {
-    configs.inbounds.forEach(e => {
-        switch (e.type) {
-            case 'trojan': {
-                if (e.password) {
-                    inbounds.set(e, new Trojan(e.password));
-                }
-                break;
-            }
-            case 'vless': {
-                if (e.uuid) {
-                    inbounds.set(e, new VLESS(e.uuid));
-                }
-                break;
-            }
+const cfCidrs6 = [
+    '2400:cb00::/32',
+    '2606:4700::/32',
+    '2803:f800::/32',
+    '2405:b500::/32',
+    '2405:8100::/32',
+    '2a06:98c0::/29',
+    '2c0f:f248::/32'
+];
+
+const ip4ToInt = ip => ip.split('.').reduce((sum, part) => (sum << 8) + parseInt(part, 10), 0) >>> 0;
+
+const isIp4InCidr = ip => cidr => {
+    const [range, bits] = cidr.split('/');
+    const mask = ~(2 ** (32 - bits) - 1);
+    return (ip4ToInt(ip) & mask) === (ip4ToInt(range) & mask);
+};
+
+const isIp4InCidrs = (ip, cidrs) => cidrs.some(isIp4InCidr(ip));
+
+const ip6ToIntArr = ip => ip
+    .replace(/\[(.+)\]/, '$1')
+    .split(':')
+    .map(part => parseInt(part, 16));
+
+const ip6ToBinaryString = ip => ip6ToIntArr(ip)
+    .map(part => part.toString(2).padStart(16, '0'))
+    .join('');
+
+const isIp6InCidr = ip => cidr => {
+    if (ip.indexOf(':') === -1) {
+        return false;
+    }
+    const [range, bits] = cidr.split('/');
+    return ip6ToBinaryString(ip).slice(0, bits) === ip6ToBinaryString(range).slice(0, bits);
+};
+
+const isIp6InCidrs = (ip, cidrs) => cidrs.some(isIp6InCidr(ip));
+
+const isIPInCFIPRanges = async (addrType, addr) => {
+    switch (addrType) {
+        case 'domain': {
+            const ip4 = await dnsQuery(addr);
+            return isIp4InCidrs(ip4, cfCidrs4);
         }
+        case 'ip4': {
+            return isIp4InCidrs(addr, cfCidrs4);
+        }
+        case 'ip6': {
+            return isIp6InCidrs(addr, cfCidrs6);
+        }
+        default: {
+            return false;
+        }
+    }
+};
+
+const dnsQuery = async (host) => {
+    const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${host}&type=A`, {
+        method: 'GET',
+        headers: {
+            'Accept': 'application/dns-json',
+        },
     });
-}());
+
+    const msg = await response.json();
+    if (msg.Status !== 0 || !msg.Answer || msg.Answer.length === 0) {
+        throw new Error('no ipv4 address');
+    }
+
+    const answer = msg.Answer.find(ans => ans.type === 1);
+    if (answer === undefined) {
+        throw new Error('no ipv4 address');
+    }
+    return answer.data;
+};
